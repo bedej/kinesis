@@ -72,6 +72,34 @@ final class BandModel: ObservableObject {
     @Published private(set) var totalGestureCount = 0
     @Published private(set) var recognizedGesture: RecognizedGesture?
     @Published private(set) var lastAction = "Controls are paused"
+    /// Apple TV mode sends gestures to Home Assistant instead of the Mac.
+    @Published var tvMode = false { didSet { defaults.set(tvMode, forKey: "tvMode") } }
+    @Published var homeAssistantURL = "" { didSet { defaults.set(homeAssistantURL, forKey: "homeAssistantURL") } }
+    @Published var homeAssistantRemote = "remote.living_room" { didSet { defaults.set(homeAssistantRemote, forKey: "homeAssistantRemote") } }
+    @Published var homeAssistantToken = "" { didSet { HomeAssistantToken.save(homeAssistantToken) } }
+    @Published private(set) var tvStatus = ""
+    private var tvGate = ActionGate(minimumInterval: 0.25)
+    /// Apple TV volume from the index pinch-and-twist: one step per `tvVolumeDegrees`, spaced out,
+    /// so a turn never floods the Apple TV with more steps than it can apply.
+    private var tvVolumeDegrees = 0.0
+    private var tvLastVolume = -Double.infinity
+    static let tvVolumeDegreesPerStep = 10.0
+    static let tvVolumeInterval = 0.2
+    /// Apple TV scrubbing from a middle-finger hold and a left/right sweep.
+    private var tvMiddlePressedAt: Double?
+    private var tvScrub: (session: Int, base: Double?, duration: Double?)?
+    private var tvScrubSession = 0
+    private var tvScrubIntegral = SIMD3<Double>.zero
+    private var tvScrubAxis: Int?
+    private var tvScrubSeconds = 0.0
+    private var tvScrubSent = 0.0
+    private var tvLastSeek = -Double.infinity
+    private var tvGyroDeviceTime: UInt64?
+    private var tvGyroBias = SIMD3<Double>.zero
+    /// A hold starts scrubbing only past this, so middle taps and double taps never do.
+    static let tvScrubHold = 0.3
+    /// Seconds of seek per degree of sweep at 1× sensitivity; 30° ≈ 90 s.
+    static let tvScrubSecondsPerDegree = 3.0
     @Published private(set) var dialEngaged = false
     @Published private(set) var pinchedFinger: String?
     @Published var tapMappings: [TapGesture: MacAction] = [.indexTap: .none, .indexDoubleTap: .playPause, .middleTap: .none, .middleDoubleTap: .mute, .middleHold: .none] {
@@ -385,6 +413,11 @@ final class BandModel: ObservableObject {
         rawEMGEnabled = developerMode && defaults.bool(forKey: "rawEMGEnabled")
         try? connection.setRawEMGEnabled(rawEMGEnabled)
         bandHand = BandHand(rawValue: defaults.string(forKey: "bandHand") ?? "") ?? .right
+        tvMode = defaults.bool(forKey: "tvMode")
+        homeAssistantURL = defaults.string(forKey: "homeAssistantURL") ?? ""
+        homeAssistantRemote = defaults.string(forKey: "homeAssistantRemote") ?? "remote.living_room"
+        homeAssistantToken = HomeAssistantToken.load()
+        tvGate.arm(at: -.infinity)
         showingSetup = !defaults.bool(forKey: "setupCompleted")
         totalGestureCount = max(0, defaults.integer(forKey: "totalGestureCount"))
         if let data = defaults.data(forKey: "band"),
@@ -622,6 +655,20 @@ final class BandModel: ObservableObject {
     }
 
     func startAutomatically() {
+        #if KINESIS_DEV
+        // Debug loop: launch with KINESIS_AUTOCONNECT=1 to connect the saved band right away.
+        if ProcessInfo.processInfo.environment["KINESIS_AUTOCONNECT"] == "1" {
+            // Claimed bands reconnect; anything else runs the full pair flow.
+            if !selectedAddress.isEmpty, BandIdentity.exists(for: selectedAddress) {
+                connectionLog.notice("Auto-connecting for a debug run")
+                connect()
+            } else {
+                connectionLog.notice("Auto-pairing for a debug run")
+                pairBand()
+            }
+            return
+        }
+        #endif
         guard startsAutomatically, !showingSetup, !selectedAddress.isEmpty else { return }
         automaticStartPending = true
         connect()
@@ -1188,6 +1235,7 @@ final class BandModel: ObservableObject {
                     pinchedFinger = nil
                 }
             }
+            if tvMode { tvMiddle(message, now: now) }
             guard let gesture = router.gesture(from: message, now: now) else { return }
             if airCursorEnabled { steadyCursor(until: now + 0.12) }
             let action: MacAction
@@ -1206,6 +1254,13 @@ final class BandModel: ObservableObject {
             gestureCount += 1
             totalGestureCount += 1
             defaults.set(totalGestureCount, forKey: "totalGestureCount")
+            if tvMode {
+                // Apple TV mode replaces the Mac actions and needs no Accessibility access.
+                guard let command = TVCommand.command(for: gesture),
+                      tvGate.allows(eventTime: message.receivedAt, now: now, live: live, trusted: true) else { return }
+                sendToTV(command)
+                return
+            }
             guard controlsEnabled, action != .none,
                   gate.allows(eventTime: message.receivedAt, now: now, live: live, trusted: controls.trusted) else {
                 return
@@ -1219,6 +1274,7 @@ final class BandModel: ObservableObject {
             dialTurned = false
             dialEngaged = engaged
             resetDial()
+            if tvMode { tvDial(engaged: engaged); return }
             if dialEngaged && controlsEnabled {
                 dialArmed = true
                 dialGate.arm(at: event.receivedAt)
@@ -1231,6 +1287,7 @@ final class BandModel: ObservableObject {
             let delta = bandHand == .left ? -rotation : rotation
             dialTurned = true
             dialTurns.send(delta)
+            if tvMode { tvDialTurn(delta, now: now); return }
             guard controlsEnabled, dialArmed, dialTarget != .none,
                   dialGate.allows(eventTime: event.receivedAt, now: now, live: live, trusted: controls.trusted) else { return }
             let steps = dialRouter.turn(delta: delta, sensitivity: dialSensitivity, now: now)
@@ -1258,6 +1315,7 @@ final class BandModel: ObservableObject {
         case .motionStreams:
             break
         case .gyro(let timestamp, let values):
+            if tvMode { tvScrubGyro(timestamp: timestamp, values: values, now: now) }
             let delay = measureLinkDelay(band: timestamp, host: event.receivedAt)
             if delay <= Self.lateInput { airPointer.receiveGyro(values, at: event.receivedAt - delay) }
             if cursorPageVisible {
@@ -1633,6 +1691,138 @@ final class BandModel: ObservableObject {
                 }
                 enrollmentStage = .failed(error.localizedDescription)
                 connection.stop()
+            }
+        }
+    }
+
+    private var homeAssistant: HomeAssistantRemote {
+        HomeAssistantRemote(baseURL: homeAssistantURL, entityID: homeAssistantRemote, token: homeAssistantToken)
+    }
+
+    /// The index pinch-and-twist is Apple TV volume only.
+    private func tvDial(engaged: Bool) {
+        tvVolumeDegrees = 0
+        if engaged { tvStatus = "Dial: volume" }
+    }
+
+    private func tvDialTurn(_ delta: Double, now: Double) {
+        // A change of direction starts over, so a wobble can't queue steps the other way.
+        if tvVolumeDegrees != 0, (tvVolumeDegrees > 0) != (delta > 0) { tvVolumeDegrees = 0 }
+        tvVolumeDegrees += delta * dialSensitivity
+        guard abs(tvVolumeDegrees) >= Self.tvVolumeDegreesPerStep, now - tvLastVolume >= Self.tvVolumeInterval else { return }
+        let up = tvVolumeDegrees > 0
+        // Keep at most one pending step; a fast turn doesn't bank a backlog.
+        tvVolumeDegrees = min(abs(tvVolumeDegrees) - Self.tvVolumeDegreesPerStep, Self.tvVolumeDegreesPerStep) * (up ? 1 : -1)
+        tvLastVolume = now
+        lastDialAction = now
+        sendToTV(up ? .volumeUp : .volumeDown)
+    }
+
+    /// Middle press and release, from the raw gesture stream.
+    private func tvMiddle(_ message: BandGesture, now: Double) {
+        guard message.finger == "middle", !message.synthetic else { return }
+        let actions = [message.action, message.derivedAction]
+        if actions.contains(where: { ["press", "buttonPress", "hold", "buttonHold"].contains($0) }) {
+            if tvMiddlePressedAt == nil { tvMiddlePressedAt = now }
+        } else if actions.contains(where: { ["release", "buttonRelease", "buttonHoldRelease"].contains($0) }) {
+            tvMiddlePressedAt = nil
+            endTVScrub()
+        }
+    }
+
+    /// Gyro samples drive the scrub while the middle finger is held.
+    private func tvScrubGyro(timestamp: UInt64, values: SIMD3<Double>, now: Double) {
+        let previous = tvGyroDeviceTime
+        tvGyroDeviceTime = timestamp
+        guard let previous, timestamp > previous, timestamp - previous <= 50_000 else { return }
+        let dt = Double(timestamp - previous) / 1e6
+        if let pressed = tvMiddlePressedAt, tvScrub == nil, now - pressed >= Self.tvScrubHold { beginTVScrub() }
+        guard let scrub = tvScrub else {
+            // Resting drift, learned only while nothing is held.
+            if tvMiddlePressedAt == nil, (0..<3).allSatisfy({ abs(values[$0] - tvGyroBias[$0]) < 45 }) {
+                tvGyroBias += (values - tvGyroBias) * (1 - exp(-dt / 2))
+            }
+            return
+        }
+        let delta = (values - tvGyroBias) * (AirPointer.gyroScale * dt)
+        tvScrubIntegral += delta
+        if tvScrubAxis == nil, let dominant = (0..<3).max(by: { abs(tvScrubIntegral[$0]) < abs(tvScrubIntegral[$1]) }),
+           abs(tvScrubIntegral[dominant]) >= 2 {
+            tvScrubAxis = dominant
+            connectionLog.notice("Scrub locked to gyro axis \(dominant, privacy: .public), first move \(self.tvScrubIntegral[dominant] > 0 ? "+" : "-", privacy: .public)")
+        }
+        guard let axis = tvScrubAxis, scrub.base != nil else { return }
+        // Same wrist correction as the dial: the left wrist reads the opposite sign.
+        let sign = bandHand == .left ? -1.0 : 1.0
+        tvScrubSeconds = sign * tvScrubIntegral[axis] * Self.tvScrubSecondsPerDegree * dialSensitivity
+        if now - tvLastSeek >= 0.4 { flushScrub(); tvLastSeek = now }
+    }
+
+    private func beginTVScrub() {
+        tvScrubSession += 1
+        let session = tvScrubSession
+        tvScrub = (session, nil, nil)
+        tvScrubIntegral = .zero
+        tvScrubAxis = nil
+        tvScrubSeconds = 0
+        tvScrubSent = 0
+        tvStatus = "Scrub: reading the position…"
+        let remote = homeAssistant
+        Task { @MainActor [weak self] in
+            let playback = try? await remote.playback()
+            guard let self, self.tvScrub?.session == session else { return }
+            guard let position = playback?.position else {
+                self.tvStatus = "Scrub: \(playback?.app ?? "this app") doesn't report its position"
+                return
+            }
+            self.tvScrub = (session, position, playback?.duration)
+            self.tvStatus = "Scrub from \(Self.clock(position)): sweep left or right"
+        }
+    }
+
+    private func endTVScrub() {
+        guard tvScrub != nil else { return }
+        flushScrub()
+        tvScrub = nil
+        tvScrubAxis = nil
+    }
+
+    /// Seeks to where the sweep has scrubbed so far, relative to the position at the start of the hold.
+    private func flushScrub() {
+        guard let scrub = tvScrub, let base = scrub.base, abs(tvScrubSeconds - tvScrubSent) >= 1 else { return }
+        tvScrubSent = tvScrubSeconds
+        let target = min(max(0, base + tvScrubSeconds), max(0, (scrub.duration ?? .infinity) - 1))
+        let remote = homeAssistant
+        tvStatus = "Scrub to \(Self.clock(target)) (\(tvScrubSeconds >= 0 ? "+" : "−")\(Int(abs(tvScrubSeconds)))s)"
+        Task { @MainActor [weak self] in
+            do { try await remote.seek(to: target) } catch { self?.tvStatus = error.localizedDescription }
+        }
+    }
+
+    private static func clock(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        return total >= 3600 ? String(format: "%d:%02d:%02d", total / 3600, total / 60 % 60, total % 60)
+                             : String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    func checkTV() {
+        let remote = HomeAssistantRemote(baseURL: homeAssistantURL, entityID: homeAssistantRemote, token: homeAssistantToken)
+        tvStatus = "Checking Home Assistant…"
+        Task { @MainActor [weak self] in
+            do { self?.tvStatus = try await remote.check() } catch { self?.tvStatus = error.localizedDescription }
+        }
+    }
+
+    func sendToTV(_ command: TVCommand) {
+        let remote = HomeAssistantRemote(baseURL: homeAssistantURL, entityID: homeAssistantRemote, token: homeAssistantToken)
+        tvStatus = "Sending \(command.title)…"
+        Task { @MainActor [weak self] in
+            do {
+                try await remote.send(command)
+                self?.tvStatus = "Sent to Apple TV: \(command.title)"
+                self?.lastAction = "Apple TV: \(command.title)"
+            } catch {
+                self?.tvStatus = error.localizedDescription
             }
         }
     }

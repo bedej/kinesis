@@ -88,12 +88,60 @@ struct MacShortcuts: MacControls {
         }
     }
 
+    /// Apps that take back and forward from mouse buttons 4 and 5. Everything else gets ⌘[ and ⌘],
+    /// which VS Code would read as outdent and indent.
+    static let navigationButtonApps: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "org.chromium.Chromium",
+        "com.brave.Browser", "com.microsoft.edgemac", "company.thebrowser.Browser", "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera", "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly",
+        "com.microsoft.VSCode", "com.microsoft.VSCodeInsiders",
+    ]
+
     func post(_ action: MacAction) throws {
         guard action != .none else { return }
         guard trusted else { throw KinesisError(message: "Allow Kinesis in Accessibility to use Mac controls.") }
+        if let direction = action.scrollDirection {
+            try Self.scroll(direction: direction)
+            return
+        }
+        if action == .back || action == .forward,
+           let app = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, Self.navigationButtonApps.contains(app) {
+            try Self.navigationButton(back: action == .back)
+            return
+        }
         let (down, up) = try Self.events(for: action)
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+    }
+
+    /// A short burst of pixel scrolls reads as one smooth trackpad-like scroll. It goes to the
+    /// window under the pointer, like a real wheel. Positive is up.
+    static func scroll(direction: Int, pixels: Int32 = 120, steps: Int = 8) throws {
+        let step = Int32(direction) * pixels / Int32(steps)
+        for index in 0..<steps {
+            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                      wheel1: step, wheel2: 0, wheel3: 0) else {
+                throw KinesisError(message: "macOS couldn't create the scroll")
+            }
+            event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            event.setIntegerValueField(.eventSourceUserData, value: shortcutEventTag)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(12 * index)) {
+                event.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    /// Mouse button 4 (back) or 5 (forward) at the pointer.
+    static func navigationButton(back: Bool) throws {
+        guard let location = CGEvent(source: nil)?.location else { return }
+        let button = CGMouseButton(rawValue: back ? 3 : 4)!
+        for type in [CGEventType.otherMouseDown, .otherMouseUp] {
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button) else {
+                throw KinesisError(message: "macOS couldn't create the navigation button")
+            }
+            event.setIntegerValueField(.eventSourceUserData, value: shortcutEventTag)
+            event.post(tap: .cghidEventTap)
+        }
     }
 
     static func events(for action: MacAction) throws -> (CGEvent, CGEvent) {

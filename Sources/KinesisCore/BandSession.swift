@@ -13,6 +13,17 @@ public final class BandSession {
     private var peerKey: Data?
     private var peerChallenge: Data?
     private var peerSeed: Data?
+    private var parameters = 3
+    private var unusualFrames = 0
+    private var frameCounts: [String: Int] = [:]
+    private var frameCountsLoggedAt = 0.0
+    /// Parameter 26 (factory band firmware 5c2b1ca1f73b+): the p31 key branch with the
+    /// encryption key reused for MACs and the 02 02 00 00 MAC prefix. Verified against
+    /// live band packets. KINESIS_P26="enc,mac,prefix" overrides it for experiments.
+    private let p26 = ProcessInfo.processInfo.environment["KINESIS_P26"]?.split(separator: ",").map(String.init)
+        ?? ["raw", "enc", "02020000"]
+    private var diagnose: (secret: Data, bandChallenge: Data, bandSeed: Data, iv: Data, counter: UInt32)?
+    private var probe: (secret: Data, bandChallenge: Data, bandSeed: Data, iv: Data, counter: UInt32)?
     private var pending = Data()
     private var transmitter: AirShieldCipher?
     private var receiver: AirShieldReceiver?
@@ -102,6 +113,40 @@ public final class BandSession {
 
     private var publicKey: Data { Data(privateKey.publicKey.x963Representation.dropFirst()) }
 
+    private func runProbe(_ probe: (secret: Data, bandChallenge: Data, bandSeed: Data, iv: Data, counter: UInt32)) throws {
+        while let marker = pending.first {
+            let head = pending.prefix(24).map { String(format: "%02x", $0) }.joined(separator: " ")
+            if [0x81, 0x82].contains(marker), pending.count >= 2, pending[1] <= 1 {
+                log.notice("Probe: control record \(head.prefix(5), privacy: .public)")
+                pending = Data(pending.dropFirst(2)); continue
+            }
+            if [0x01, 0x02].contains(marker), pending.count >= 2 {
+                let size = 3 + Int(pending[1])
+                guard pending.count >= size else { return }
+                log.notice("Probe: relay record \(head, privacy: .public)")
+                pending = Data(pending.dropFirst(size)); continue
+            }
+            guard [0x40, 0x41, 0x42].contains(marker) else {
+                log.notice("Probe: unknown record \(head, privacy: .public) (\(self.pending.count, privacy: .public) bytes)")
+                throw BandProtocolError("Encryption probe: unknown record")
+            }
+            guard pending.count >= 10 else { return }
+            let size = 10 + (Int(pending[9]) + 1) * 16
+            guard pending.count >= size else { return }
+            log.notice("Probe: packet \(head, privacy: .public), \(size, privacy: .public) bytes")
+            let results = AirShieldProbe.test(packet: Data(pending.prefix(size)), secret: probe.secret, hostChallenge: challenge,
+                                              hostSeed: seed, bandChallenge: probe.bandChallenge, bandSeed: probe.bandSeed,
+                                              iv: probe.iv, counter: probe.counter)
+            if results.isEmpty { log.notice("Probe: no candidate verified the packet MAC") }
+            for line in results { log.notice("Probe: \(line, privacy: .public)") }
+            throw BandProtocolError("Encryption probe finished; see logs")
+        }
+    }
+
+    /// The link-setup reply arrives on 0x8001, or with factory firmware (parameter 26)
+    /// on a session-tagged channel such as 0x9d01; the low byte names the service.
+    private static func isLinkChannel(_ channel: UInt16) -> Bool { channel & 0x80ff == 0x8001 }
+
     public func request() throws -> Data {
         try BandWire.frame(channel: 0x8001, words: [0x81000005, 0x02000001], payload:
             BandWire.field(1, publicKey) + BandWire.field(2, challenge) + BandWire.field(3, 0)
@@ -112,7 +157,7 @@ public final class BandSession {
         pending.append(bytes)
         var outgoing = Data()
         var events: [BandEvent] = []
-        while receiver == nil, pending.count >= 4 {
+        while receiver == nil, probe == nil, pending.count >= 4 {
             guard pending[0] & 0x80 != 0 else { throw BandProtocolError("Unexpected bytes before band encryption") }
             let size = Int(pending.be16(0) & 0x7fff) + 4
             guard size >= 8 else { throw BandProtocolError("Invalid band setup length") }
@@ -127,26 +172,62 @@ public final class BandSession {
             let peer = try P256.KeyAgreement.PublicKey(x963Representation: Data([4]) + point)
             switch kind {
             case 0x02000001:
-                guard peerKey == nil, try fields.integer(3) == 0, try fields.integer(4) == 3 else {
-                    throw BandProtocolError("Unsupported band encryption parameters")
+                let mode = try? fields.integer(3), chosen = try? fields.integer(4)
+                log.notice("Band encryption offer: field 3 = \(String(describing: mode), privacy: .public), parameters = \(String(describing: chosen), privacy: .public)")
+                // Field 4 is a supported-parameters bit set. Parameter 3 is the
+                // verified band mode; newer firmware offers a superset (e.g. 27).
+                // Factory firmware offers 27 and then insists on 26 whatever the host picks.
+                // An offer of exactly 3 (original band) or 31 (glasses) keeps the verified modes.
+                if p26.count == 3, let chosen, chosen & 26 == 26, chosen & 4 == 0, peerKey == nil, mode == 0 {
+                    parameters = 26
+                    log.notice("Using parameters 26: enc \(self.p26[0], privacy: .public), mac \(self.p26[1], privacy: .public), prefix \(self.p26[2], privacy: .public)")
+                } else {
+                    guard peerKey == nil, mode == 0, let chosen, chosen & 3 == 3 || chosen == 31 else {
+                        throw BandProtocolError("Unsupported band encryption parameters")
+                    }
+                    parameters = chosen & 3 == 3 ? 3 : 31
                 }
                 peerKey = point
                 peerChallenge = try fields.bytes(2, count: 16)
                 outgoing.append(try BandWire.frame(channel: 1, words: [0x02000002], payload:
                     BandWire.field(1, publicKey) + BandWire.field(2, seed) + BandWire.field(3, iv)
-                    + BandWire.field(4, UInt64(base)) + BandWire.field(5, 3)))
+                    + BandWire.field(4, UInt64(base)) + BandWire.field(5, UInt64(parameters))))
             case 0x02000002:
-                guard point == peerKey, let peerChallenge, try fields.integer(5) == 3 else {
+                let intFields = fields.fieldNumbers.filter { ![1, 2, 3].contains($0) }
+                    .map { "\($0)=\((try? fields.integer($0)).map(String.init) ?? "bytes")" }.joined(separator: " ")
+                log.notice("Band encryption response: same key \(point == self.peerKey, privacy: .public), fields \(fields.fieldNumbers, privacy: .public), values \(intFields, privacy: .public), we chose \(self.parameters, privacy: .public)")
+                guard point == peerKey, let peerChallenge else {
                     throw BandProtocolError("Unexpected band encryption response")
                 }
                 let secret = try privateKey.sharedSecretFromKeyAgreement(with: peer).withUnsafeBytes { Data($0) }
+                let bandParameters = try fields.integer(5)
+                if bandParameters != UInt64(parameters) {
+                    guard let counter = UInt32(exactly: try fields.integer(4)) else { throw BandProtocolError("Invalid band packet counter") }
+                    probe = (secret, peerChallenge, try fields.bytes(2, count: 32), try fields.bytes(3, count: 16), counter)
+                    log.notice("Band chose parameters \(bandParameters, privacy: .public); waiting for its first packet to test key candidates")
+                    break
+                }
                 let peerSeed = try fields.bytes(2, count: 32)
                 self.peerSeed = peerSeed
                 let peerIV = try fields.bytes(3, count: 16)
                 let peerBase = try fields.integer(4)
                 guard let peerCounter = UInt32(exactly: peerBase) else { throw BandProtocolError("Invalid band packet counter") }
-                transmitter = AirShieldCipher(keys: try AirShieldKeys(secret: secret, challenge: peerChallenge, seed: seed), iv: iv, counter: base)
-                receiver = AirShieldReceiver(cipher: AirShieldCipher(keys: try AirShieldKeys(secret: secret, challenge: challenge, seed: peerSeed), iv: peerIV, counter: peerCounter))
+                if parameters == 26 {
+                    let prefix = p26[2] == "none" ? Data() : Data(stride(from: 0, to: p26[2].count, by: 2).compactMap {
+                        UInt8(p26[2].dropFirst($0).prefix(2), radix: 16) })
+                    transmitter = AirShieldCipher(keys: AirShieldKeys(experimental: secret, challenge: peerChallenge, seed: seed, enc: p26[0], mac: p26[1]),
+                                                  iv: iv, counter: base, macPrefix: prefix)
+                    receiver = AirShieldReceiver(cipher: AirShieldCipher(keys: AirShieldKeys(experimental: secret, challenge: challenge, seed: peerSeed, enc: p26[0], mac: p26[1]),
+                                                                         iv: peerIV, counter: peerCounter, macPrefix: prefix))
+                    diagnose = (secret, peerChallenge, peerSeed, peerIV, peerCounter)
+                } else {
+                    let prefix = parameters == 31 ? Data([2, 2, 0, 0]) : Data()
+                    transmitter = AirShieldCipher(keys: try AirShieldKeys(secret: secret, challenge: peerChallenge, seed: seed, parameters: parameters),
+                                                  iv: iv, counter: base, macPrefix: prefix)
+                    receiver = AirShieldReceiver(cipher: AirShieldCipher(keys: try AirShieldKeys(secret: secret, challenge: challenge, seed: peerSeed, parameters: parameters),
+                                                                         iv: peerIV, counter: peerCounter, macPrefix: prefix))
+                }
+                log.notice("Band encryption established with parameters \(self.parameters, privacy: .public)")
                 if let ceremony {
                     // Enrollment startup runs the ownership ceremony instead of
                     // the identity queries; it rejoins the enrolled flow at trust.
@@ -166,12 +247,50 @@ public final class BandSession {
             default: throw BandProtocolError("Unrecognized band setup message")
             }
         }
+        if let probe { try runProbe(probe); return (outgoing, events) }
+        if let context = diagnose, receiver != nil, !pending.isEmpty {
+            let head = pending.prefix(12).map { String(format: "%02x", $0) }.joined(separator: " ")
+            log.notice("P26: band sent \(self.pending.count, privacy: .public) bytes after encryption: \(head, privacy: .public)")
+            if pending.first == 0x40, pending.count >= 10, pending.count >= 10 + (Int(pending[9]) + 1) * 16 {
+                diagnose = nil
+                let size = 10 + (Int(pending[9]) + 1) * 16
+                let results = AirShieldProbe.test(packet: Data(pending.prefix(size)), secret: context.secret, hostChallenge: challenge,
+                                                  hostSeed: seed, bandChallenge: context.bandChallenge, bandSeed: context.bandSeed,
+                                                  iv: context.iv, counter: context.counter)
+                if results.isEmpty { log.notice("P26: no recipe verified the band's packet") }
+                for line in results { log.notice("P26: \(line, privacy: .public)") }
+            }
+        }
         if receiver != nil {
             let records = try receiver!.feed(pending)
             pending.removeAll(keepingCapacity: true)
+            if time - frameCountsLoggedAt >= 10, !frameCounts.isEmpty {
+                frameCountsLoggedAt = time
+                let summary = frameCounts.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+                log.notice("Frame counts (channel/type): \(summary, privacy: .public)")
+                frameCounts.removeAll()
+            }
             for plaintext in records {
                 authenticatedPackets += 1
+                if parameters == 26, authenticatedPackets <= 8 {
+                    let hex = { (d: Data) in d.map { String(format: "%02x", $0) }.joined(separator: " ") }
+                    log.notice("P26 plaintext \(self.authenticatedPackets, privacy: .public): \(plaintext.count, privacy: .public) bytes, head \(hex(plaintext.prefix(16)), privacy: .public), tail \(hex(plaintext.suffix(8)), privacy: .public)")
+                }
                 for frame in try datax.feed(plaintext) {
+                    if frame.words.last == 0x02000316 {
+                        // Band firmware log line (UTF-8 text inside the protobuf).
+                        let text = String(decoding: frame.payload.filter { $0 >= 0x20 && $0 < 0x7f }, as: UTF8.self)
+                        log.notice("Band log: \(text, privacy: .public)")
+                        continue
+                    }
+                    let key = "\(String(frame.channel, radix: 16))/\(frame.words.last.map { String($0, radix: 16) } ?? "-")"
+                    frameCounts[key, default: 0] += 1
+                    if streaming, frame.words.last != 0x0200020f, unusualFrames < 400, frameCounts[key]! <= 6 {
+                        unusualFrames += 1
+                        let words = frame.words.map { String($0, radix: 16) }.joined(separator: ",")
+                        let body = frame.payload.prefix(40).map { String(format: "%02x", $0) }.joined(separator: " ")
+                        log.notice("Frame channel \(String(frame.channel, radix: 16), privacy: .public) words [\(words, privacy: .public)] \(frame.payload.count, privacy: .public) bytes: \(body, privacy: .public)")
+                    }
                     events += try input(frame, at: time, outgoing: &outgoing)
                 }
                 if streaming, !stopping, time - lastHeartbeat >= 0.2 {
@@ -239,7 +358,12 @@ public final class BandSession {
     private func streamControl(_ motion: MotionStreams, raw: Bool?) -> Data {
         (raw.map { BandWire.field(2, $0 ? 1 : 0) } ?? Data())
             + BandWire.field(3, 1) + BandWire.field(6, motion.gyro ? 1 : 0) + BandWire.field(8, motion.orientation ? 1 : 0)
+            + Self.extraStreams.reduce(into: Data()) { $0 += BandWire.field($1, 1) }
     }
+
+    /// Debug: KINESIS_STREAMS="25,26" also enables these stream flags.
+    private static let extraStreams: [Int] = (ProcessInfo.processInfo.environment["KINESIS_STREAMS"] ?? "")
+        .split(separator: ",").compactMap { Int($0) }
 
     /// Asks for these motion streams. Before the subscription it only changes what
     /// the subscription asks for. While another stream change is in flight it waits;
@@ -404,7 +528,11 @@ public final class BandSession {
         case 0x02002005:
             return [try adoptEnrolledIdentity(ceremony.complete(words: frame.words, payload: frame.payload),
                                               outgoing: &outgoing, at: time)]
-        default: return []
+        default:
+            let words = frame.words.map { String($0, radix: 16) }.joined(separator: ",")
+            let body = frame.payload.prefix(48).map { String(format: "%02x", $0) }.joined(separator: " ")
+            log.notice("Ceremony: unhandled frame channel \(String(frame.channel, radix: 16), privacy: .public) words [\(words, privacy: .public)] payload \(frame.payload.count, privacy: .public): \(body, privacy: .public)")
+            return []
         }
     }
 
@@ -462,7 +590,7 @@ public final class BandSession {
             }
             bandTrusted = true
             outgoing.append(try encrypt(BandWire.frame(channel: frame.channel & 0x7fff, words: [0x03001000])))
-        } else if kind == 0x02001000, frame.channel == 0x8001, endLinkSent {
+        } else if kind == 0x02001000, Self.isLinkChannel(frame.channel), endLinkSent {
             let fields = try ProtoFields(frame.payload)
             guard try fields.requiredInteger(1) == 1, try fields.bytes(2).count == 16 else {
                 throw BandProtocolError("Unexpected band link setup response")
@@ -521,7 +649,7 @@ public final class BandSession {
         if enrollment != nil, setupStage == .identity, !stopping {
             return try receiveIdentity(frame, outgoing: &outgoing)
         }
-        if kind == 0x02001000, frame.channel == 0x8001, setupStage == .link, !stopping {
+        if kind == 0x02001000, Self.isLinkChannel(frame.channel), setupStage == .link, !stopping {
             let fields = try ProtoFields(frame.payload)
             guard try fields.requiredInteger(1) == 1 else {
                 throw BandProtocolError("The band couldn't finish setting up the connection. Try reconnecting.")
@@ -627,6 +755,12 @@ public final class BandSession {
         if kind == 0x02000315 {
             let fields = try ProtoFields(frame.payload)
             let request = try fields.integer(1)
+            if let flagBytes = try? fields.bytes(5), let flags = try? ProtoFields(flagBytes) {
+                let summary = flags.fieldNumbers.map { "\($0)=\((try? flags.integer($0)).map(String.init) ?? "bytes")" }.joined(separator: " ")
+                log.notice("Stream response \(request, privacy: .public): status \((try? fields.integer(2)).map(String.init) ?? "?", privacy: .public), fields \(fields.fieldNumbers, privacy: .public), flags \(summary, privacy: .public)")
+            } else {
+                log.notice("Stream response \(request, privacy: .public): status \((try? fields.integer(2)).map(String.init) ?? "?", privacy: .public), fields \(fields.fieldNumbers, privacy: .public), no flags")
+            }
             if let pending = motionRequest, request == pending.id {
                 motionRequest = nil
                 guard !stopping else { return [] }
@@ -656,9 +790,20 @@ public final class BandSession {
                     throw BandProtocolError("The band rejected the input subscription")
                 }
                 let flags = try ProtoFields(fields.bytes(5))
-                streamsEnabled = try streamFields.allSatisfy { try flags.contains($0) && flags.integer($0) == 1 }
+                let granted = flags.fieldNumbers.map { "\($0)=\((try? flags.integer($0)).map(String.init) ?? "bytes")" }.joined(separator: " ")
+                log.notice("Input subscription \(request, privacy: .public): asked \(self.streamFields, privacy: .public), band flags \(granted, privacy: .public)")
+                // Gestures are required; newer firmware may decline a motion stream,
+                // so keep what the band granted instead of failing the connection.
+                streamsEnabled = try flags.contains(3) && flags.integer(3) == 1
+                if !streamsEnabled, request == 3, !flags.contains(3) {
+                    // Newer firmware acknowledges only part of the change; read the full state.
+                    outgoing.append(try streamRequest(id: 5, enabled: nil))
+                    return []
+                }
                 guard streamsEnabled else { throw BandProtocolError("The band input subscription stopped") }
-                if request == 3, rawEMG, rawRequest == nil {
+                motion = MotionStreams(gyro: try flags.contains(6) && flags.integer(6) == 1,
+                                       orientation: try flags.contains(8) && flags.integer(8) == 1)
+                if !streaming, rawEMG, rawRequest == nil {
                     outgoing.append(try setRawEMGEnabled(true, at: time))
                 }
                 if !streaming {

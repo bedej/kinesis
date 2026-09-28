@@ -10,8 +10,11 @@ struct GesturesPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             Text("little moves. your rules.").font(KinesisType.title).tracking(-1.2).reveal(0)
-            PillTray(options: ["swipe", "tap", "turn"].map { Choice($0, $0) }, selection: family,
+            PillTray(options: ["swipe", "tap", "turn", "apple tv"].map { Choice($0, $0) }, selection: family,
                      select: { family = $0 }, label: "Gesture family").reveal(1)
+            if family == "apple tv" {
+                AppleTVSettings(model: model).reveal(2)
+            } else {
             VStack(alignment: .leading, spacing: 7) {
                 Text(family == "swipe" ? "a shortcut at your fingertips." : family == "tap" ? "taps, and one hold." : "turn it just a little.")
                     .font(KinesisType.headline).tracking(-0.4)
@@ -61,6 +64,7 @@ struct GesturesPage: View {
                 .font(KinesisType.micro).foregroundStyle(KinesisStyle.secondary).padding(.top, -10).reveal(4)
             Text(family == "swipe" ? "desktop actions use the Mac’s Control + arrow shortcuts. window and tab actions stay in the current app." : family == "tap" ? "single taps and the hold start unassigned. holding the index finger is the dial, so only the middle finger has a hold." : "volume follows your audio output, including AirPods. brightness controls your Mac’s display; external displays may not respond. pinch again after changing settings.")
                 .font(KinesisType.caption).foregroundStyle(KinesisStyle.secondary).lineSpacing(4).reveal(5)
+            }
         }
         .animation(reduceMotion ? nil : KinesisMotion.settle, value: family)
     }
@@ -76,6 +80,69 @@ struct GesturesPage: View {
                                     @ViewBuilder control: @escaping () -> Control) -> some View {
         Flash(trigger: trigger, held: held) { glow in
             OpenRow(symbol: symbol, title: title, glow: glow) { control() }
+        }
+    }
+}
+
+/// Apple TV mode: gestures go to a Home Assistant `remote` entity instead of the Mac.
+private struct AppleTVSettings: View {
+    @ObservedObject var model: BandModel
+    private let mapping: [(String, String, TVCommand)] = [
+        ("arrow.up", "swipe up", .up), ("arrow.down", "swipe down", .down),
+        ("arrow.left", "swipe left", .left), ("arrow.right", "swipe right", .right),
+        ("hand.tap", "index tap", .select), ("hand.tap", "middle double tap", .menu),
+        ("hand.tap", "index double tap", .playPause), ("hand.tap", "middle tap", .home),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("your couch, your remote.").font(KinesisType.headline).tracking(-0.4)
+                Text("while this is on, gestures go to your Apple TV through Home Assistant instead of your Mac.")
+                    .font(KinesisType.caption).foregroundStyle(KinesisStyle.secondary)
+            }
+            Toggle("Send gestures to Apple TV", isOn: $model.tvMode).toggleStyle(KinesisToggleStyle())
+            VStack(alignment: .leading, spacing: 10) {
+                field("home assistant address") {
+                    TextField("http://homeassistant.local:8123", text: $model.homeAssistantURL)
+                }
+                field("apple tv remote entity") {
+                    TextField("remote.living_room", text: $model.homeAssistantRemote)
+                }
+                field("long-lived access token") {
+                    SecureField("paste from your Home Assistant profile", text: $model.homeAssistantToken)
+                }
+            }
+            HStack(spacing: 12) {
+                Button("check") { model.checkTV() }.buttonStyle(KinesisButtonStyle())
+                Button("test: select") { model.sendToTV(.select) }.buttonStyle(KinesisButtonStyle())
+            }
+            HStack {
+                Text(model.tvStatus).font(KinesisType.caption).foregroundStyle(KinesisStyle.secondary)
+                    .lineLimit(6).textSelection(.enabled)
+            }
+            VStack(spacing: 2) {
+                ForEach(mapping, id: \.1) { symbol, gesture, command in
+                    OpenRow(symbol: symbol, title: gesture, glow: 0) {
+                        Text(command.title).font(KinesisType.label).foregroundStyle(KinesisStyle.secondary)
+                    }
+                }
+                OpenRow(symbol: "dial.low", title: "index pinch + twist", glow: 0) {
+                    Text("volume").font(KinesisType.label).foregroundStyle(KinesisStyle.secondary)
+                }
+                OpenRow(symbol: "hand.raised", title: "middle hold + sweep", glow: 0) {
+                    Text("scrub (seek)").font(KinesisType.label).foregroundStyle(KinesisStyle.secondary)
+                }
+            }
+            Text("create the token under your Home Assistant profile › security. it’s stored in your Mac’s keychain. the entity is the Apple TV integration’s remote, not its media player.")
+                .font(KinesisType.caption).foregroundStyle(KinesisStyle.secondary).lineSpacing(4)
+        }
+    }
+
+    private func field<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label).font(KinesisType.micro).foregroundStyle(KinesisStyle.secondary)
+            content().textFieldStyle(.roundedBorder).font(KinesisType.body)
         }
     }
 }

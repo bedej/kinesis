@@ -61,6 +61,8 @@ struct ProtoFields {
         return bytes
     }
     func contains(_ field: Int) -> Bool { values[field] != nil }
+    /// Field numbers present, for diagnostics.
+    var fieldNumbers: [Int] { values.keys.sorted() }
 }
 
 enum BandWire {
@@ -106,8 +108,9 @@ struct DataXReceiver {
         }
         var bytes = plaintext
         let padding = Int(bytes.last!) - 0xc0
-        // Only the repeated suffix observed on the tested firmware is stripped.
-        if (1...15).contains(padding), bytes.suffix(padding).allSatisfy({ Int($0) == 0xc0 + padding }) {
+        // Only the repeated suffix is stripped. Factory firmware (parameter 26) pads an
+        // already aligned frame with a whole block of 0xd0 (16).
+        if (1...16).contains(padding), bytes.suffix(padding).allSatisfy({ Int($0) == 0xc0 + padding }) {
             bytes.removeLast(padding)
         }
         pending.append(bytes)

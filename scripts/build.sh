@@ -51,7 +51,7 @@ if [ -z "$signing_identity" ]; then
 fi
 codesign --force --options runtime --sign "$signing_identity" "$staged_app"
 codesign --verify --deep --strict "$staged_app"
-lipo "$staged_app/Contents/MacOS/Kinesis" -verify_arch arm64 x86_64
+for arch in arm64 x86_64; do lipo "$staged_app/Contents/MacOS/Kinesis" -verify_arch "$arch"; done
 plutil -lint "$staged_app/Contents/Info.plist"
 
 if [ -e "$app_path" ]; then mv "$app_path" "$stage_dir/previous.app"; fi

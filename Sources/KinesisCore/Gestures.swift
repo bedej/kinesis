@@ -203,6 +203,7 @@ public struct DialRouter: Sendable {
 
 public enum MacAction: String, CaseIterable, Codable, Identifiable, Sendable {
     case none, previousDesktop, nextDesktop, missionControl, dismiss, previousWindow, nextWindow, previousTab, nextTab
+    case back, forward, scrollUp, scrollDown
     case playPause, mute, volumeUp, volumeDown, brightnessUp, brightnessDown
     public var id: String { rawValue }
     public var title: String {
@@ -216,6 +217,10 @@ public enum MacAction: String, CaseIterable, Codable, Identifiable, Sendable {
         case .nextWindow: "Next window"
         case .previousTab: "Previous tab"
         case .nextTab: "Next tab"
+        case .back: "Back"
+        case .forward: "Forward"
+        case .scrollUp: "Scroll up"
+        case .scrollDown: "Scroll down"
         case .playPause: "Play / pause"
         case .mute: "Mute / unmute"
         case .volumeUp: "Volume up"
@@ -235,6 +240,10 @@ public enum MacAction: String, CaseIterable, Codable, Identifiable, Sendable {
         case .nextWindow: "⌘ `"
         case .previousTab: "⌃ ⇧ ⇥"
         case .nextTab: "⌃ ⇥"
+        case .back: "⌘ ["
+        case .forward: "⌘ ]"
+        case .scrollUp: "scroll ↑"
+        case .scrollDown: "scroll ↓"
         case .playPause: "⏯"
         case .mute: "mute"
         case .volumeUp, .brightnessUp: "+"
@@ -243,16 +252,20 @@ public enum MacAction: String, CaseIterable, Codable, Identifiable, Sendable {
     }
     public var keyCode: UInt16? {
         switch self {
-        case .none, .playPause, .mute, .volumeUp, .volumeDown, .brightnessUp, .brightnessDown: nil
+        case .none, .playPause, .mute, .volumeUp, .volumeDown, .brightnessUp, .brightnessDown, .scrollUp, .scrollDown: nil
         case .previousDesktop: 123
         case .nextDesktop: 124
         case .missionControl: 126
         case .dismiss: 53
         case .previousWindow, .nextWindow: 50
         case .previousTab, .nextTab: 48
+        case .back: 33
+        case .forward: 30
         }
     }
-    public var usesCommand: Bool { self == .previousWindow || self == .nextWindow }
+    public var usesCommand: Bool { [.previousWindow, .nextWindow, .back, .forward].contains(self) }
+    /// Scroll actions post wheel events instead of a key press.
+    public var scrollDirection: Int? { self == .scrollUp ? 1 : self == .scrollDown ? -1 : nil }
     public var usesControl: Bool { [.previousDesktop, .nextDesktop, .missionControl, .previousTab, .nextTab].contains(self) }
     public var usesShift: Bool { self == .previousWindow || self == .previousTab }
 }

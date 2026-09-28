@@ -86,6 +86,8 @@ final class NativeBandConnection: NSObject, BandConnection,
     private let psmID = CBUUID(string: "2D41DA7C-82B6-42AA-B34E-E2E01DF8CC1A")
     private let batteryServiceID = CBUUID(string: "180F")
     private let batteryID = CBUUID(string: "2A19")
+    private let infoServiceID = CBUUID(string: "180A")
+    private let revisionIDs = [CBUUID(string: "2A26"), CBUUID(string: "2A28"), CBUUID(string: "2A27")]
     private var now: Double { ProcessInfo.processInfo.systemUptime }
 
     func start(_ operation: BandOperation, onEvent: @escaping (BandEvent) -> Void,
@@ -357,7 +359,7 @@ final class NativeBandConnection: NSObject, BandConnection,
         stage = "discovering services"
         emit(BandEvent(.preparing))
         peripheral.delegate = self
-        peripheral.discoverServices([serviceID, batteryServiceID])
+        peripheral.discoverServices([serviceID, batteryServiceID, infoServiceID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -380,7 +382,8 @@ final class NativeBandConnection: NSObject, BandConnection,
         log.info("Band services discovered")
         stage = "discovering characteristics"
         for service in services {
-            peripheral.discoverCharacteristics(service.uuid == serviceID ? [psmID] : [batteryID], for: service)
+            peripheral.discoverCharacteristics(service.uuid == serviceID ? [psmID]
+                                               : service.uuid == infoServiceID ? revisionIDs : [batteryID], for: service)
         }
     }
 
@@ -409,6 +412,11 @@ final class NativeBandConnection: NSObject, BandConnection,
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard accepts(peripheral) else { return }
+        if revisionIDs.contains(characteristic.uuid) {
+            let text = characteristic.value.flatMap { String(data: $0, encoding: .utf8) } ?? "unreadable"
+            log.notice("Band revision \(characteristic.uuid.uuidString, privacy: .public): \(text, privacy: .public)")
+            return
+        }
         if characteristic.uuid == batteryID {
             if error == nil, let bytes = characteristic.value, bytes.count == 1, let value = bytes.first, value <= 100 {
                 emit(BandEvent(.battery(Int(value))))
@@ -421,12 +429,21 @@ final class NativeBandConnection: NSObject, BandConnection,
             log.error("Input channel read failed: \(native.domain, privacy: .public) \(native.code, privacy: .public)")
             fail(Self.explainingPairing(error)); return
         }
-        guard characteristic.uuid == psmID, let bytes = characteristic.value, bytes == Data([255, 0]) else {
+        guard characteristic.uuid == psmID else { return }
+        let bytes = characteristic.value ?? Data()
+        let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+        log.notice("Input channel value: [\(hex, privacy: .public)] (\(bytes.count, privacy: .public) bytes)")
+        // The characteristic holds the L2CAP PSM as a little-endian UInt16.
+        guard bytes.count >= 2 else {
             fail(KinesisError(message: "Unsupported band input channel")); return
         }
-        log.info("Opening native L2CAP channel")
+        let psm = CBL2CAPPSM(bytes[bytes.startIndex]) | CBL2CAPPSM(bytes[bytes.startIndex + 1]) << 8
+        guard psm != 0 else {
+            fail(KinesisError(message: "Unsupported band input channel")); return
+        }
+        log.info("Opening native L2CAP channel \(psm, privacy: .public)")
         stage = "opening input channel"
-        peripheral.openL2CAPChannel(255)
+        peripheral.openL2CAPChannel(psm)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
